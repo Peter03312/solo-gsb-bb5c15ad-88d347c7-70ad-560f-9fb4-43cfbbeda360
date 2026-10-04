@@ -91,6 +91,39 @@ class LicenseChangeResponse(BaseModel):
     allowed_uses: list[str]
     content_hash: str
     created_at: datetime
+    revocation: "RevocationReceipt | None" = Field(
+        default=None, description="该变更已作废时的作废回执；未作废时为 null"
+    )
+
+
+class ChangeRevocationRequest(BaseModel):
+    change_id: str = Field(min_length=1, description="待作废的原许可变更标识")
+    revocation_id: str | None = Field(
+        default=None, min_length=1, max_length=128, description="唯一作废标识；省略时自动生成 UUID"
+    )
+    reason: str = Field(min_length=1, max_length=1024, description="作废原因")
+
+    @field_validator("reason")
+    @classmethod
+    def _reason(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("reason 不能为空白字符串")
+        return value
+
+
+class RevocationReceipt(BaseModel):
+    """作废回执：原标识、作废标识、原因与登记时间，可按作废标识追溯。"""
+
+    revocation_id: str
+    change_id: str
+    reason: str
+    registered_at: datetime
+
+
+class RevocationResponse(BaseModel):
+    replayed: bool = Field(description="同一作废标识与内容重试时为 true，返回原回执")
+    receipt: RevocationReceipt
 
 
 class BasisEntry(BaseModel):

@@ -47,10 +47,22 @@ SCHEMA_STATEMENTS = [
         created_at    TEXT NOT NULL
     )
     """,
+    # A license change can be revoked at most once. The original row stays in
+    # license_changes (it remains queryable and replayable); every evaluation
+    # path filters out changes whose id appears here.
+    """
+    CREATE TABLE IF NOT EXISTS change_revocations (
+        revocation_id TEXT PRIMARY KEY,
+        change_id     TEXT NOT NULL UNIQUE REFERENCES license_changes(change_id),
+        reason        TEXT NOT NULL,
+        created_at    TEXT NOT NULL
+    )
+    """,
     "CREATE INDEX IF NOT EXISTS idx_changes_version_time "
     "ON license_changes(version_id, effective_at)",
     "CREATE INDEX IF NOT EXISTS idx_parents_version ON version_parents(version_id)",
     "CREATE INDEX IF NOT EXISTS idx_parents_parent ON version_parents(parent_id)",
+    "CREATE INDEX IF NOT EXISTS idx_revocations_change ON change_revocations(change_id)",
 ]
 
 
@@ -228,8 +240,45 @@ class Database:
         )
 
     def latest_change(self, version_id: str, at: str) -> dict[str, Any] | None:
+        # Revoked changes never take effect for any query instant.
         return self.query_one(
-            "SELECT * FROM license_changes WHERE version_id = ? AND effective_at <= ? "
-            "ORDER BY effective_at DESC, change_id LIMIT 1",
+            "SELECT lc.* FROM license_changes lc "
+            "LEFT JOIN change_revocations cr ON cr.change_id = lc.change_id "
+            "WHERE lc.version_id = ? AND lc.effective_at <= ? AND cr.change_id IS NULL "
+            "ORDER BY lc.effective_at DESC, lc.change_id LIMIT 1",
             (version_id, at),
+        )
+
+    # -- change revocations ----------------------------------------------
+
+    def get_revocation(self, revocation_id: str) -> dict[str, Any] | None:
+        return self.query_one(
+            "SELECT * FROM change_revocations WHERE revocation_id = ?",
+            (revocation_id,),
+        )
+
+    def get_revocation_of_change(self, change_id: str) -> dict[str, Any] | None:
+        return self.query_one(
+            "SELECT * FROM change_revocations WHERE change_id = ?",
+            (change_id,),
+        )
+
+    def list_revoked_change_ids(self) -> list[str]:
+        rows = self._conn.execute(
+            "SELECT change_id FROM change_revocations ORDER BY change_id"
+        ).fetchall()
+        return [row["change_id"] for row in rows]
+
+    def insert_revocation(
+        self,
+        revocation_id: str,
+        change_id: str,
+        reason: str,
+        created_at: str,
+    ) -> None:
+        self._conn.execute(
+            "INSERT INTO change_revocations "
+            "(revocation_id, change_id, reason, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (revocation_id, change_id, reason, created_at),
         )

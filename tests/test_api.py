@@ -808,6 +808,316 @@ def test_timeline_empty_use_is_400(client):
     assert resp.status_code == 400
 
 
+# -- change revocation ------------------------------------------------------
+
+
+def _revoke(client, change_id, revocation_id="rev-1", reason="登记有误"):
+    return client.post(
+        "/license-changes/revocations",
+        json={
+            "change_id": change_id,
+            "revocation_id": revocation_id,
+            "reason": reason,
+        },
+    )
+
+
+def _revocation(client, revocation_id):
+    return client.get(f"/license-changes/revocations/{revocation_id}")
+
+
+def test_revoke_returns_receipt_and_is_traceable(client):
+    _register(client, "v1")
+    first = _change(client, "c1", "v1", _iso(2026, 1, 1), ["research"])
+    assert first.status_code == 201
+
+    resp = _revoke(client, "c1", "r1", "用途登记有误，撤回")
+    assert resp.status_code == 201, resp.text
+    receipt = resp.json()
+    assert receipt["replayed"] is False
+    assert receipt["receipt"] == {
+        "revocation_id": "r1",
+        "change_id": "c1",
+        "reason": "用途登记有误，撤回",
+        "registered_at": receipt["receipt"]["registered_at"],
+    }
+    assert receipt["receipt"]["registered_at"]  # server-assigned instant
+    assert receipt["receipt"]["registered_at"].startswith("20")
+
+    # The receipt can be retrieved again by its own unique id.
+    fetched = _revocation(client, "r1")
+    assert fetched.status_code == 200
+    assert fetched.json() == receipt["receipt"]
+
+
+def test_revoke_same_id_same_content_retry_returns_original_receipt(client):
+    _register(client, "v1")
+    _change(client, "c1", "v1", _iso(2026, 1, 1), ["research"])
+    first = _revoke(client, "c1", "r1", "登记有误")
+    assert first.status_code == 201
+
+    retry = _revoke(client, "c1", "r1", "登记有误")
+    assert retry.status_code == 200
+    assert retry.json()["replayed"] is True
+    assert retry.json()["receipt"] == first.json()["receipt"]
+
+
+def test_revoke_reusing_id_with_different_content_conflicts(client):
+    _register(client, "v1")
+    _register(client, "v2")
+    _change(client, "c1", "v1", _iso(2026, 1, 1), ["research"])
+    _change(client, "c2", "v2", _iso(2026, 1, 1), ["research"])
+    assert _revoke(client, "c1", "r1", "第一个原因").status_code == 201
+
+    # Same revocation id, different reason.
+    resp = _revoke(client, "c1", "r1", "另一个原因")
+    assert resp.status_code == 409
+    assert resp.json()["error"] == "conflict"
+
+    # Same revocation id pointing at a different change.
+    resp = _revoke(client, "c2", "r1", "第一个原因")
+    assert resp.status_code == 409
+
+    # The original receipt is untouched and still retrievable.
+    fetched = _revocation(client, "r1").json()
+    assert fetched["change_id"] == "c1"
+    assert fetched["reason"] == "第一个原因"
+
+
+def test_revoke_same_change_under_another_id_conflicts(client):
+    _register(client, "v1")
+    _change(client, "c1", "v1", _iso(2026, 1, 1), ["research"])
+    assert _revoke(client, "c1", "r1").status_code == 201
+
+    resp = _revoke(client, "c1", "r2")
+    assert resp.status_code == 409
+    assert resp.json()["details"]["existing_revocation_id"] == "r1"
+    assert _revocation(client, "r2").status_code == 404
+
+
+def test_revoke_unknown_change_is_404(client):
+    resp = _revoke(client, "ghost", "r1")
+    assert resp.status_code == 404
+    assert resp.json()["error"] == "not_found"
+
+
+def test_revoke_blank_reason_is_422(client):
+    _register(client, "v1")
+    _change(client, "c1", "v1", _iso(2026, 1, 1), ["research"])
+    resp = client.post(
+        "/license-changes/revocations",
+        json={"change_id": "c1", "revocation_id": "r1", "reason": "   "},
+    )
+    assert resp.status_code == 422
+
+
+def test_revoked_change_still_queryable_but_marked(client):
+    _register(client, "v1")
+    _change(client, "c1", "v1", _iso(2026, 1, 1), ["research"])
+    _revoke(client, "c1", "r1", "登记有误")
+
+    resp = client.get("/license-changes/c1")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["change_id"] == "c1"
+    assert body["revocation"] is not None
+    assert body["revocation"]["revocation_id"] == "r1"
+    assert body["revocation"]["change_id"] == "c1"
+    assert body["revocation"]["reason"] == "登记有误"
+
+    # The version detail carries the same revocation marker.
+    version = client.get("/versions/v1").json()
+    assert version["changes"][0]["revocation"]["revocation_id"] == "r1"
+
+
+def test_revoked_change_ignored_by_point_check_at_every_instant(client):
+    _register(client, "a")
+    _change(client, "c1", "a", _iso(2026, 1, 1), ["research", "review"])
+    _change(client, "c2", "a", _iso(2026, 6, 1), ["research"])
+    _revoke(client, "c2", "r1", "收紧变更登记错误")
+
+    # Before the revoked change existed the earlier change applied anyway.
+    assert _check(client, "a", "review", _iso(2026, 5, 1)).json()["allowed"] is True
+    # After it: it is ignored, so the earlier change remains the latest active.
+    body = _check(client, "a", "review", _iso(2026, 7, 1)).json()
+    assert body["allowed"] is True
+    assert body["basis"][0]["change_id"] == "c1"
+    assert body["blockers"] == []
+
+
+def test_revoke_only_change_yields_no_valid_license(client):
+    _register(client, "a")
+    _change(client, "c1", "a", _iso(2026, 1, 1), ["research"])
+    _revoke(client, "c1", "r1", "登记有误")
+
+    body = _check(client, "a", "research", _iso(2026, 7, 1)).json()
+    assert body["allowed"] is False
+    assert body["blockers"] == [
+        {"version_id": "a", "reason": "no_valid_license", "change_id": None, "effective_at": None, "allowed_uses": []}
+    ]
+    assert body["basis"] == []
+
+
+def test_revoked_change_blocks_descendants_via_no_valid_license(client):
+    _register(client, "a")
+    _change(client, "ca", "a", _iso(2026, 1, 1), ["research", "review"])
+    _register(client, "d1", ["a"])
+    _change(client, "cd1", "d1", _iso(2026, 1, 1), ["research", "review"])
+    _revoke(client, "ca", "r1", "登记有误")
+
+    body = _check(client, "d1", "review", _iso(2026, 5, 1)).json()
+    assert body["allowed"] is False
+    assert body["blockers"] == [
+        {"version_id": "a", "reason": "no_valid_license", "change_id": None, "effective_at": None, "allowed_uses": []}
+    ]
+
+
+def test_replay_of_revoked_change_does_not_restore_it(client):
+    _register(client, "v1")
+    _change(client, "c1", "v1", _iso(2026, 1, 1), ["research", "review"])
+    _revoke(client, "c1", "r1", "登记有误")
+
+    # Same id and content: replay returns 200, still marked revoked.
+    replay = _change(client, "c1", "v1", _iso(2026, 1, 1), ["review", "research"])
+    assert replay.status_code == 200
+    assert replay.json()["replayed"] is True
+    assert replay.json()["change"]["revocation"] is not None
+    assert replay.json()["change"]["revocation"]["revocation_id"] == "r1"
+
+    # And point checks still ignore it.
+    assert _check(client, "v1", "review", _iso(2026, 5, 1)).json()["allowed"] is False
+
+
+def test_revoked_change_ignored_by_timeline(client):
+    _register(client, "v1")
+    _change(client, "c1", "v1", _iso(2026, 1, 1), ["research", "review"])
+    _change(client, "c2", "v1", _iso(2026, 6, 1), ["research"])
+    _revoke(client, "c2", "r1", "登记有误")
+
+    body = _timeline(client, "v1", "review", _iso(2026, 3, 1), _iso(2026, 9, 1)).json()
+    # Only non-revoked changes segment the interval: c2 is gone, so the whole
+    # interval is one allowed segment based on c1, same fields as before.
+    assert len(body["segments"]) == 1
+    segment = body["segments"][0]
+    assert segment["allowed"] is True
+    assert [entry["change_id"] for entry in segment["basis"]] == ["c1"]
+    assert segment["blockers"] == []
+    assert segment["allowed_uses_intersection"] == ["research", "review"]
+    assert segment["start"].startswith("2026-03-01T00:00:00")
+    assert segment["end"].startswith("2026-09-01T00:00:00")
+
+
+def test_revoking_latest_change_exposes_earlier_one_in_timeline(client):
+    _register(client, "v1")
+    _change(client, "c1", "v1", _iso(2026, 1, 1), ["research"])
+    _change(client, "c2", "v1", _iso(2026, 6, 1), ["research", "review"])
+    _revoke(client, "c2", "r1", "登记有误")
+
+    body = _timeline(client, "v1", "review", _iso(2026, 3, 1), _iso(2026, 9, 1)).json()
+    assert len(body["segments"]) == 1
+    segment = body["segments"][0]
+    # review is denied throughout on the sole remaining change c1.
+    assert segment["allowed"] is False
+    assert segment["blockers"][0]["change_id"] == "c1"
+
+
+def test_preview_uses_revoked_snapshot_and_does_not_persist(client):
+    _register(client, "a")
+    _change(client, "ca1", "a", _iso(2026, 1, 1), ["research"])
+    # A voided proposal that would have opened up review.
+    _change(client, "ca2", "a", _iso(2026, 4, 1), ["research", "review"])
+    _revoke(client, "ca2", "r1", "登记有误")
+
+    at = _iso(2026, 5, 1)
+    # Current evaluation already ignores the revoked change.
+    assert _check(client, "a", "review", at).json()["allowed"] is False
+
+    body = _preview_flip(
+        client, "cp1", "a", _iso(2026, 4, 15), ["research", "review"], "review", at
+    ).json()
+    flips = {entry["version_id"]: entry for entry in body["impacted_versions"]}
+    assert set(flips) == {"a"}
+    assert flips["a"]["before_blockers"][0]["change_id"] == "ca1"
+    assert flips["a"]["after_allowed"] is True
+    assert client.get("/license-changes/cp1").status_code == 404
+
+    # A preview at the same instant as the revoked change still conflicts:
+    # the existing same-version/same-time rule ignores revocation state.
+    conflict = _preview_flip(
+        client, "cp2", "a", _iso(2026, 4, 1), ["commercial"], "commercial", at
+    )
+    assert conflict.status_code == 409
+
+
+def test_revoke_is_idempotent_under_concurrent_retries(client):
+    _register(client, "v1")
+    _change(client, "c1", "v1", _iso(2026, 1, 1), ["research"])
+    service = client.app.state.app_state.service  # type: ignore[attr-defined]
+    statuses: list[tuple[str, int, bool]] = []
+    lock = __import__("threading").Lock()
+
+    def worker() -> None:
+        try:
+            _, replayed = service.revoke_change("c1", "r1", "登记有误")
+            with lock:
+                statuses.append(("ok", 200 if replayed else 201, replayed))
+        except Exception as exc:  # noqa: BLE001
+            with lock:
+                statuses.append((type(exc).__name__, getattr(exc, "status_code", 0), False))
+
+    import threading
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert all(name == "ok" for name, _, _ in statuses), statuses
+    # Exactly one first-time creation; every other identical retry replays.
+    assert sorted(code for _, code, _ in statuses).count(201) == 1
+    assert all(replayed == (code == 200) for _, code, replayed in statuses)
+    assert _revocation(client, "r1").status_code == 200
+
+
+def test_demo_seed_revocation_round_trip(tmp_path):
+    db_path = str(tmp_path / "seed-rev.db")
+    settings = Settings(db_path=db_path, init_db=True, seed_demo=True, echo=False)
+    with TestClient(create_app(settings)) as test_client:
+        # demo-root-a narrows to research on 2026-06-01 via demo-chg-a-2.
+        resp = test_client.post(
+            "/license-changes/revocations",
+            json={
+                "change_id": "demo-chg-a-2",
+                "revocation_id": "rev-demo-a-2",
+                "reason": "示例：收紧变更登记有误",
+            },
+        )
+        assert resp.status_code == 201
+        # After voiding, review stays allowed in July for the derived version
+        # (root-a's earlier research+review change is the latest active one),
+        # subject to root-b's still-existing block.
+        body = test_client.get(
+            "/permissions/check",
+            params={
+                "version_id": "demo-derived-1",
+                "use": "review",
+                "at": "2026-07-01T00:00:00Z",
+            },
+        ).json()
+        assert body["allowed"] is False
+        blockers = {(bl["version_id"], bl["reason"]) for bl in body["blockers"]}
+        assert blockers == {("demo-root-b", "use_not_allowed")}
+        assert all(entry["change_id"] != "demo-chg-a-2" for entry in body["basis"])
+        # The receipt is traceable and the original change still retrievable.
+        receipt = test_client.get("/license-changes/revocations/rev-demo-a-2")
+        assert receipt.status_code == 200
+        assert receipt.json()["change_id"] == "demo-chg-a-2"
+        original = test_client.get("/license-changes/demo-chg-a-2")
+        assert original.status_code == 200
+        assert original.json()["revocation"]["revocation_id"] == "rev-demo-a-2"
+
+
 def test_timeline_on_demo_seed(tmp_path):
     db_path = str(tmp_path / "seed3.db")
     settings = Settings(db_path=db_path, init_db=True, seed_demo=True, echo=False)

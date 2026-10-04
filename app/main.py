@@ -15,6 +15,7 @@ from .database import Database
 from .schemas import (
     BasisEntry,
     BlockerEntry,
+    ChangeRevocationRequest,
     CreateResponse,
     ErrorDetail,
     ImpactedVersion,
@@ -27,6 +28,8 @@ from .schemas import (
     PreviewChangeStub,
     PreviewQuery,
     PreviewResponse,
+    RevocationReceipt,
+    RevocationResponse,
     VersionCreateRequest,
     VersionResponse,
 )
@@ -225,6 +228,45 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 ImpactedVersion(**entry) for entry in result["impacted_versions"]
             ],
         )
+
+    @app.post(
+        "/license-changes/revocations",
+        response_model=RevocationResponse,
+        status_code=201,
+        tags=["license-changes"],
+        summary="作废一条已登记的许可变更（幂等）",
+        responses={
+            200: {"description": "同一作废标识与内容重试，返回原回执"},
+            201: {"description": "作废已登记，返回回执"},
+            404: {"description": "目标许可变更不存在"},
+            409: {"description": "作废标识复用指向不同内容，或该变更已被另一标识作废"},
+        },
+    )
+    def revoke_change(
+        payload: ChangeRevocationRequest, request: Request
+    ) -> JSONResponse | RevocationResponse:
+        receipt, replayed = service_from(request).revoke_change(
+            change_id=payload.change_id,
+            revocation_id=payload.revocation_id,
+            reason=payload.reason,
+        )
+        body = RevocationResponse(
+            replayed=replayed, receipt=RevocationReceipt(**receipt)
+        )
+        if replayed:
+            # 200 OK distinguishes an idempotent retry from a first-time void.
+            return JSONResponse(status_code=200, content=body.model_dump(mode="json"))
+        return body
+
+    @app.get(
+        "/license-changes/revocations/{revocation_id}",
+        response_model=RevocationReceipt,
+        tags=["license-changes"],
+        summary="按作废标识追溯作废回执",
+        responses={404: {"description": "作废回执不存在"}},
+    )
+    def get_revocation(revocation_id: str, request: Request) -> RevocationReceipt:
+        return RevocationReceipt(**service_from(request).get_revocation(revocation_id))
 
     # -- permission check -------------------------------------------------
 

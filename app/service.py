@@ -83,7 +83,9 @@ class InvalidIntervalError(ServiceError):
 # -- serialisation ---------------------------------------------------------
 
 
-def _change_out(row: dict[str, Any]) -> dict[str, Any]:
+def _change_out(
+    row: dict[str, Any], revocation: dict[str, Any] | None = None
+) -> dict[str, Any]:
     return {
         "change_id": row["change_id"],
         "version_id": row["version_id"],
@@ -91,16 +93,30 @@ def _change_out(row: dict[str, Any]) -> dict[str, Any]:
         "allowed_uses": list(row["allowed_uses"]),
         "content_hash": row["content_hash"],
         "created_at": parse_canonical(row["created_at"]),
+        "revocation": _revocation_out(revocation) if revocation is not None else None,
+    }
+
+
+def _revocation_out(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "revocation_id": row["revocation_id"],
+        "change_id": row["change_id"],
+        "reason": row["reason"],
+        "registered_at": parse_canonical(row["created_at"]),
     }
 
 
 def _version_out(db: Database, row: dict[str, Any]) -> dict[str, Any]:
+    changes = []
+    for change in db.list_changes(row["version_id"]):
+        revocation = db.get_revocation_of_change(change["change_id"])
+        changes.append(_change_out(change, revocation))
     return {
         "version_id": row["version_id"],
         "created_at": parse_canonical(row["created_at"]),
         "note": row["note"],
         "parent_ids": db.get_parents(row["version_id"]),
-        "changes": [_change_out(c) for c in db.list_changes(row["version_id"])],
+        "changes": changes,
     }
 
 
@@ -219,7 +235,10 @@ class LicenseService:
                             "existing_effective_at": existing["effective_at"],
                         },
                     )
-                return _change_out(existing), True
+                # Replays never touch the revocation table: re-submitting a
+                # voided change returns the same record but cannot un-void it.
+                revocation = self.db.get_revocation_of_change(change_id)
+                return _change_out(existing, revocation), True
 
             twin = self.db.change_at_same_time(version_id, effective)
             if twin is not None and twin["change_id"] != change_id:
@@ -245,7 +264,8 @@ class LicenseService:
                 existing = self.db.get_change(change_id)
                 if existing is not None:
                     if existing["content_hash"] == digest:
-                        return _change_out(existing), True
+                        revocation = self.db.get_revocation_of_change(change_id)
+                        return _change_out(existing, revocation), True
                     raise ConflictError(
                         "相同变更标识已存在但内容不同", {"change_id": change_id}
                     ) from None
@@ -269,7 +289,113 @@ class LicenseService:
         row = self.db.get_change(change_id)
         if row is None:
             raise NotFoundError("变更不存在", {"change_id": change_id})
-        return _change_out(row)
+        # A revoked change remains fully queryable: its voiding is reported on
+        # the same record rather than hiding it.
+        revocation = self.db.get_revocation_of_change(change_id)
+        return _change_out(row, revocation)
+
+    # -- change revocations ----------------------------------------------
+
+    def revoke_change(
+        self,
+        change_id: str,
+        revocation_id: str | None,
+        reason: str,
+    ) -> tuple[dict[str, Any], bool]:
+        """Void a previously submitted license change.
+
+        A revocation takes effect for every query instant immediately: single
+        point checks, timeline segments and previews all ignore the revoked
+        change afterwards. The original change row is never deleted. Returns
+        ``(receipt, replayed)``.
+
+        Idempotency follows the revocation id: retrying with the same
+        ``revocation_id``, target change and reason returns the original
+        receipt. Reusing an id with different content, or voiding the same
+        change under a different id, is a conflict; an unknown target change
+        is ``404``.
+        """
+        reason = reason.strip()
+        if not reason:
+            raise ServiceError("作废原因不能为空")
+        revocation_id = revocation_id or f"r-{uuid.uuid4().hex}"
+
+        with self.db.lock:
+            target = self.db.get_change(change_id)
+            if target is None:
+                raise NotFoundError(
+                    "目标许可变更不存在，无法作废", {"change_id": change_id}
+                )
+
+            by_id = self.db.get_revocation(revocation_id)
+            by_change = self.db.get_revocation_of_change(change_id)
+
+            if by_id is not None:
+                same = (
+                    by_id["change_id"] == change_id and by_id["reason"] == reason
+                )
+                if not same:
+                    raise ConflictError(
+                        "同一作废标识已存在但内容不同（作废标识不可复用指向不同内容）",
+                        {
+                            "revocation_id": revocation_id,
+                            "submitted_change_id": change_id,
+                            "existing_change_id": by_id["change_id"],
+                            "submitted_reason": reason,
+                            "existing_reason": by_id["reason"],
+                        },
+                    )
+                return _revocation_out(by_id), True
+
+            if by_change is not None:
+                raise ConflictError(
+                    "该许可变更已被另一作废标识作废，不能重复作废",
+                    {
+                        "change_id": change_id,
+                        "existing_revocation_id": by_change["revocation_id"],
+                        "submitted_revocation_id": revocation_id,
+                    },
+                )
+
+            registered = to_canonical(now_utc())
+            try:
+                self.db.begin()
+                self.db.insert_revocation(revocation_id, change_id, reason, registered)
+                self.db.commit()
+            except Exception:
+                self.db.rollback()
+                # Concurrent writers may have won one of the unique
+                # constraints; map each race onto the same 409 semantics.
+                by_id = self.db.get_revocation(revocation_id)
+                if by_id is not None:
+                    if by_id["change_id"] == change_id and by_id["reason"] == reason:
+                        return _revocation_out(by_id), True
+                    raise ConflictError(
+                        "同一作废标识已存在但内容不同（作废标识不可复用指向不同内容）",
+                        {"revocation_id": revocation_id},
+                    ) from None
+                by_change = self.db.get_revocation_of_change(change_id)
+                if by_change is not None:
+                    raise ConflictError(
+                        "该许可变更已被另一作废标识作废，不能重复作废",
+                        {
+                            "change_id": change_id,
+                            "existing_revocation_id": by_change["revocation_id"],
+                        },
+                    ) from None
+                raise
+
+            stored = self.db.get_revocation(revocation_id)
+            assert stored is not None
+            return _revocation_out(stored), False
+
+    def get_revocation(self, revocation_id: str) -> dict[str, Any]:
+        row = self.db.get_revocation(revocation_id)
+        if row is None:
+            raise NotFoundError(
+                "作废回执不存在", {"revocation_id": revocation_id}
+            )
+        return _revocation_out(row)
 
     # -- permission query -------------------------------------------------
 
@@ -359,11 +485,12 @@ class LicenseService:
         All reads come from one pinned snapshot (the same mechanism as the
         change preview), so the ancestor closure and every change seen here
         belong to a single consistent view. Segment boundaries are the
-        effective instants of the closure's changes strictly inside the
-        interval; a change exactly at ``start`` applies from the first
-        segment on, a change exactly at ``end`` is not counted. Segments are
-        only split where the basis or the blocking information changes —
-        adjacent identical segments are merged.
+        effective instants of the closure's non-revoked changes strictly
+        inside the interval; a change exactly at ``start`` applies from the
+        first segment on, a change exactly at ``end`` is not counted. Revoked
+        changes are ignored for every segment. Segments are only split where
+        the basis or the blocking information changes — adjacent identical
+        segments are merged.
         """
         if start.tzinfo is None or end.tzinfo is None:
             raise InvalidTimeError("起止时刻必须带时区信息")
@@ -394,6 +521,9 @@ class LicenseService:
         interior: set[str] = set()
         for vid in closure:
             for change in snapshot.changes.get(vid, ()):
+                if change.change_id in snapshot.revoked_change_ids:
+                    # Revoked changes neither split segments nor set policy.
+                    continue
                 if start_c < change.effective_at < end_c:
                     interior.add(change.effective_at)
         edges = [start_c, *sorted(interior), end_c]
@@ -562,6 +692,7 @@ class LicenseService:
         try:
             versions = {row["version_id"] for row in self.db.list_versions()}
             edges = self.db.all_parent_edges()
+            revoked = set(self.db.list_revoked_change_ids())
             changes: dict[str, list[EffectiveChange]] = {}
             rows = self.db.query_all(
                 "SELECT * FROM license_changes ORDER BY version_id, effective_at, change_id"
@@ -575,7 +706,12 @@ class LicenseService:
                         allowed_uses=list(row["allowed_uses"]),
                     )
                 )
-            return Snapshot(versions=versions, edges=edges, changes=changes)
+            return Snapshot(
+                versions=versions,
+                edges=edges,
+                changes=changes,
+                revoked_change_ids=revoked,
+            )
         finally:
             self.db.rollback()
 
@@ -595,6 +731,7 @@ class Snapshot:
     versions: set[str]
     edges: list[tuple[str, str]]  # (child, parent) in registration order
     changes: dict[str, list[EffectiveChange]]  # keyed by version, time-sorted
+    revoked_change_ids: set[str] = frozenset()  # type: ignore[assignment]
     parents_map: dict[str, list[str]] = field(default_factory=dict)
     children_map: dict[str, list[str]] = field(default_factory=dict)
 
@@ -655,6 +792,9 @@ class Snapshot:
         """
         stored: EffectiveChange | None = None
         for change in self.changes.get(version_id, ()):  # time-sorted
+            if change.change_id in self.revoked_change_ids:
+                # A voiding applies at every query instant: skipped entirely.
+                continue
             if change.effective_at <= at_canonical:
                 stored = change
             else:

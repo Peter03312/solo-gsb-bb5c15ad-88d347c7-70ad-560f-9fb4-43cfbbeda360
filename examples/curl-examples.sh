@@ -57,3 +57,36 @@ curl -s -X POST "$BASE/license-changes/preview" -H 'Content-Type: application/js
 say "预演：相同标识与内容重放 -> replayed=true 且无影响（不写入）"
 curl -s -X POST "$BASE/license-changes/preview" -H 'Content-Type: application/json' \
   -d '{"change_id":"demo-chg-a-1","version_id":"demo-root-a","effective_at":"2026-01-01T00:00:00Z","allowed_uses":["review","research"],"use":"research","at":"2026-05-01T00:00:00Z"}'; echo
+
+say "作废：作废 example-c1（登记有误），返回回执"
+curl -s -X POST "$BASE/license-changes/revocations" -H 'Content-Type: application/json' \
+  -d '{"change_id":"example-c1","revocation_id":"rev-example-c1","reason":"允许用途登记有误，撤回"}'; echo
+
+say "作废重试：同一作废标识与内容 -> 200 replayed=true，返回原回执"
+curl -s -X POST "$BASE/license-changes/revocations" -H 'Content-Type: application/json' \
+  -d '{"change_id":"example-c1","revocation_id":"rev-example-c1","reason":"允许用途登记有误，撤回"}'; echo
+
+say "作废冲突 1：同一作废标识换原因 -> 409"
+curl -s -X POST "$BASE/license-changes/revocations" -H 'Content-Type: application/json' \
+  -d '{"change_id":"example-c1","revocation_id":"rev-example-c1","reason":"换个原因"}'; echo
+
+say "作废冲突 2：另一作废标识重复作废同一变更 -> 409"
+curl -s -X POST "$BASE/license-changes/revocations" -H 'Content-Type: application/json' \
+  -d '{"change_id":"example-c1","revocation_id":"rev-example-c1-again","reason":"允许用途登记有误，撤回"}'; echo
+
+say "作废目标不存在 -> 404"
+curl -s -X POST "$BASE/license-changes/revocations" -H 'Content-Type: application/json' \
+  -d '{"change_id":"no-such-change","revocation_id":"rev-ghost","reason":"x"}'; echo
+
+say "作废追溯：按作废标识取回回执"
+curl -s "$BASE/license-changes/revocations/rev-example-c1"; echo
+
+say "原变更仍可按原接口查询，附带 revocation 回执"
+curl -s "$BASE/license-changes/example-c1"; echo
+
+say "作废立即对所有查询时刻生效：example-v1 再无未作废变更 -> no_valid_license"
+curl -s "$BASE/permissions/check?version_id=example-v1&use=research&at=2026-05-01T00:00:00Z"; echo
+
+say "重放已作废变更不能恢复：仍 replayed=true 且带 revocation"
+curl -s -X POST "$BASE/license-changes" -H 'Content-Type: application/json' \
+  -d '{"change_id":"example-c1","version_id":"example-v1","effective_at":"2026-03-01T00:00:00Z","allowed_uses":["research"]}'; echo
