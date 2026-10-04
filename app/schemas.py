@@ -69,6 +69,22 @@ class LicenseChangeRequest(BaseModel):
         return _normalise_uses(values)
 
 
+class LicenseChangeVoidRequest(BaseModel):
+    void_id: str | None = Field(
+        default=None, min_length=1, max_length=128, description="作废标识；省略时自动生成 UUID"
+    )
+    change_id: str = Field(min_length=1, description="要作废的原许可变更标识")
+    reason: str = Field(min_length=1, max_length=512, description="作废原因（必填，随回执保存）")
+
+    @field_validator("reason")
+    @classmethod
+    def _reason(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("reason 不能为空字符串")
+        return value
+
+
 # -- responses -------------------------------------------------------------
 
 
@@ -82,6 +98,15 @@ class VersionResponse(BaseModel):
     changes: list["LicenseChangeResponse"]
 
 
+class LicenseChangeVoidResponse(BaseModel):
+    """作废回执：原变更标识、作废原因与登记时间（UTC）。"""
+
+    void_id: str
+    change_id: str
+    reason: str
+    created_at: datetime
+
+
 class LicenseChangeResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -91,6 +116,10 @@ class LicenseChangeResponse(BaseModel):
     allowed_uses: list[str]
     content_hash: str
     created_at: datetime
+    void: LicenseChangeVoidResponse | None = Field(
+        default=None,
+        description="作废回执；未被作废时为 null。作废后原变更仍可查询，仅不再参与判定",
+    )
 
 
 class BasisEntry(BaseModel):
@@ -155,6 +184,7 @@ class CreateResponse(BaseModel):
     replayed: bool
     change: LicenseChangeResponse | None = None
     version: VersionResponse | None = None
+    void: LicenseChangeVoidResponse | None = None
 
 
 # -- change preview --------------------------------------------------------

@@ -51,6 +51,20 @@ SCHEMA_STATEMENTS = [
     "ON license_changes(version_id, effective_at)",
     "CREATE INDEX IF NOT EXISTS idx_parents_version ON version_parents(version_id)",
     "CREATE INDEX IF NOT EXISTS idx_parents_parent ON version_parents(parent_id)",
+    # Void receipts for erroneous changes. The change row itself is kept
+    # (still queryable); the receipt only excludes it from evaluation.
+    """
+    CREATE TABLE IF NOT EXISTS license_change_voids (
+        void_id     TEXT PRIMARY KEY,
+        change_id   TEXT NOT NULL REFERENCES license_changes(change_id),
+        reason      TEXT NOT NULL,
+        created_at  TEXT NOT NULL
+    )
+    """,
+    # A change can be voided at most once: voiding the same change under a
+    # second void id is a conflict, enforced by this unique index.
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_voids_change "
+    "ON license_change_voids(change_id)",
 ]
 
 
@@ -228,8 +242,47 @@ class Database:
         )
 
     def latest_change(self, version_id: str, at: str) -> dict[str, Any] | None:
+        """Latest non-voided change of a version effective at or before ``at``.
+
+        Voided changes are invisible to every query instant: the evaluation
+        falls back to the most recent change that has not been voided.
+        """
         return self.query_one(
-            "SELECT * FROM license_changes WHERE version_id = ? AND effective_at <= ? "
-            "ORDER BY effective_at DESC, change_id LIMIT 1",
+            "SELECT c.* FROM license_changes c "
+            "WHERE c.version_id = ? AND c.effective_at <= ? "
+            "AND NOT EXISTS ("
+            "    SELECT 1 FROM license_change_voids v WHERE v.change_id = c.change_id"
+            ") "
+            "ORDER BY c.effective_at DESC, c.change_id LIMIT 1",
             (version_id, at),
+        )
+
+    # -- license change voids ----------------------------------------------
+
+    def get_void(self, void_id: str) -> dict[str, Any] | None:
+        return self.query_one(
+            "SELECT * FROM license_change_voids WHERE void_id = ?", (void_id,)
+        )
+
+    def get_void_for_change(self, change_id: str) -> dict[str, Any] | None:
+        return self.query_one(
+            "SELECT * FROM license_change_voids WHERE change_id = ?", (change_id,)
+        )
+
+    def list_voids(self) -> list[dict[str, Any]]:
+        return self.query_all(
+            "SELECT * FROM license_change_voids ORDER BY created_at, void_id"
+        )
+
+    def insert_void(
+        self,
+        void_id: str,
+        change_id: str,
+        reason: str,
+        created_at: str,
+    ) -> None:
+        self._conn.execute(
+            "INSERT INTO license_change_voids (void_id, change_id, reason, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (void_id, change_id, reason, created_at),
         )

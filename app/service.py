@@ -83,7 +83,20 @@ class InvalidIntervalError(ServiceError):
 # -- serialisation ---------------------------------------------------------
 
 
-def _change_out(row: dict[str, Any]) -> dict[str, Any]:
+def _void_out(row: dict[str, Any]) -> dict[str, Any]:
+    """Serialise a void receipt: original change id, reason, registered at."""
+    return {
+        "void_id": row["void_id"],
+        "change_id": row["change_id"],
+        "reason": row["reason"],
+        "created_at": parse_canonical(row["created_at"]),
+    }
+
+
+def _change_out(db: Database, row: dict[str, Any]) -> dict[str, Any]:
+    # A voided change stays queryable through the original interface; its
+    # receipt is attached so callers can trace the void (null while valid).
+    void_row = db.get_void_for_change(row["change_id"])
     return {
         "change_id": row["change_id"],
         "version_id": row["version_id"],
@@ -91,6 +104,7 @@ def _change_out(row: dict[str, Any]) -> dict[str, Any]:
         "allowed_uses": list(row["allowed_uses"]),
         "content_hash": row["content_hash"],
         "created_at": parse_canonical(row["created_at"]),
+        "void": _void_out(void_row) if void_row is not None else None,
     }
 
 
@@ -100,7 +114,7 @@ def _version_out(db: Database, row: dict[str, Any]) -> dict[str, Any]:
         "created_at": parse_canonical(row["created_at"]),
         "note": row["note"],
         "parent_ids": db.get_parents(row["version_id"]),
-        "changes": [_change_out(c) for c in db.list_changes(row["version_id"])],
+        "changes": [_change_out(db, c) for c in db.list_changes(row["version_id"])],
     }
 
 
@@ -219,7 +233,7 @@ class LicenseService:
                             "existing_effective_at": existing["effective_at"],
                         },
                     )
-                return _change_out(existing), True
+                return _change_out(self.db, existing), True
 
             twin = self.db.change_at_same_time(version_id, effective)
             if twin is not None and twin["change_id"] != change_id:
@@ -245,7 +259,7 @@ class LicenseService:
                 existing = self.db.get_change(change_id)
                 if existing is not None:
                     if existing["content_hash"] == digest:
-                        return _change_out(existing), True
+                        return _change_out(self.db, existing), True
                     raise ConflictError(
                         "相同变更标识已存在但内容不同", {"change_id": change_id}
                     ) from None
@@ -263,13 +277,111 @@ class LicenseService:
 
             stored = self.db.get_change(change_id)
             assert stored is not None
-            return _change_out(stored), False
+            return _change_out(self.db, stored), False
 
     def get_change(self, change_id: str) -> dict[str, Any]:
         row = self.db.get_change(change_id)
         if row is None:
             raise NotFoundError("变更不存在", {"change_id": change_id})
-        return _change_out(row)
+        return _change_out(self.db, row)
+
+    # -- license change voids ----------------------------------------------
+
+    def void_change(
+        self,
+        void_id: str | None,
+        change_id: str,
+        reason: str,
+    ) -> tuple[dict[str, Any], bool]:
+        """Void a registered license change; returns ``(receipt, replayed)``.
+
+        The void takes effect for every query instant as soon as it is
+        committed: point checks fall back to the latest non-voided change
+        (or block with ``no_valid_license``), timelines are segmented by
+        non-voided changes only, and previews evaluate on the same
+        post-void snapshot. The change row itself is never deleted — it
+        stays queryable with its receipt attached.
+
+        A retry with the same void id and identical content (target change
+        and reason) returns the original receipt; reusing the id for
+        different content, or voiding the same change under a second id,
+        is a conflict. Replays of the original *change* submission never
+        revive a voided change.
+        """
+        reason = reason.strip()
+        if not reason:
+            raise ServiceError("作废原因不能为空")
+        void_id = void_id or f"void-{uuid.uuid4().hex}"
+
+        with self.db.lock:
+            if self.db.get_change(change_id) is None:
+                raise NotFoundError("目标变更不存在，无法作废", {"change_id": change_id})
+
+            existing = self.db.get_void(void_id)
+            if existing is not None:
+                same = existing["change_id"] == change_id and existing["reason"] == reason
+                if not same:
+                    raise ConflictError(
+                        "相同作废标识已存在但内容不同",
+                        {
+                            "void_id": void_id,
+                            "submitted_change_id": change_id,
+                            "existing_change_id": existing["change_id"],
+                        },
+                    )
+                return _void_out(existing), True
+
+            prior = self.db.get_void_for_change(change_id)
+            if prior is not None:
+                raise ConflictError(
+                    "该变更已被作废，不能以另一标识重复作废",
+                    {
+                        "change_id": change_id,
+                        "existing_void_id": prior["void_id"],
+                        "submitted_void_id": void_id,
+                    },
+                )
+
+            created = to_canonical(now_utc())
+            try:
+                self.db.begin()
+                self.db.insert_void(void_id, change_id, reason, created)
+                self.db.commit()
+            except Exception:
+                self.db.rollback()
+                # Concurrent writers may have won the unique constraints;
+                # map both id and change collisions onto clear conflicts.
+                existing = self.db.get_void(void_id)
+                if existing is not None:
+                    if existing["change_id"] == change_id and existing["reason"] == reason:
+                        return _void_out(existing), True
+                    raise ConflictError(
+                        "相同作废标识已存在但内容不同", {"void_id": void_id}
+                    ) from None
+                prior = self.db.get_void_for_change(change_id)
+                if prior is not None:
+                    raise ConflictError(
+                        "该变更已被作废，不能以另一标识重复作废",
+                        {
+                            "change_id": change_id,
+                            "existing_void_id": prior["void_id"],
+                            "submitted_void_id": void_id,
+                        },
+                    ) from None
+                raise
+
+            stored = self.db.get_void(void_id)
+            assert stored is not None
+            return _void_out(stored), False
+
+    def get_void(self, void_id: str) -> dict[str, Any]:
+        row = self.db.get_void(void_id)
+        if row is None:
+            raise NotFoundError("作废回执不存在", {"void_id": void_id})
+        return _void_out(row)
+
+    def list_voids(self) -> list[dict[str, Any]]:
+        return [_void_out(row) for row in self.db.list_voids()]
 
     # -- permission query -------------------------------------------------
 
@@ -562,9 +674,15 @@ class LicenseService:
         try:
             versions = {row["version_id"] for row in self.db.list_versions()}
             edges = self.db.all_parent_edges()
+            # Voided changes are excluded: timelines and previews evaluate
+            # on the same post-void snapshot as point checks.
             changes: dict[str, list[EffectiveChange]] = {}
             rows = self.db.query_all(
-                "SELECT * FROM license_changes ORDER BY version_id, effective_at, change_id"
+                "SELECT c.* FROM license_changes c "
+                "WHERE NOT EXISTS ("
+                "    SELECT 1 FROM license_change_voids v WHERE v.change_id = c.change_id"
+                ") "
+                "ORDER BY c.version_id, c.effective_at, c.change_id"
             )
             for row in rows:
                 changes.setdefault(row["version_id"], []).append(

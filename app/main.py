@@ -20,6 +20,8 @@ from .schemas import (
     ImpactedVersion,
     LicenseChangeRequest,
     LicenseChangeResponse,
+    LicenseChangeVoidRequest,
+    LicenseChangeVoidResponse,
     PermissionResponse,
     PermissionSegment,
     PermissionTimelineResponse,
@@ -188,10 +190,58 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         "/license-changes/{change_id}",
         response_model=LicenseChangeResponse,
         tags=["license-changes"],
-        summary="按标识查询许可变更",
+        summary="按标识查询许可变更（已作废的变更仍可查询，响应附带 void 回执）",
     )
     def get_change(change_id: str, request: Request) -> LicenseChangeResponse:
         return LicenseChangeResponse(**service_from(request).get_change(change_id))
+
+    # -- license change voids -----------------------------------------------
+
+    @app.post(
+        "/license-change-voids",
+        response_model=CreateResponse,
+        status_code=201,
+        tags=["license-changes"],
+        summary="作废一条登记有误的许可变更（幂等，提交即对所有查询时刻生效）",
+        responses={
+            200: {"description": "相同作废标识与内容的重复提交，返回原回执"},
+            201: {"description": "作废已登记，返回回执"},
+            404: {"description": "目标变更不存在"},
+            409: {"description": "作废标识复用指向不同内容，或该变更已被另一标识作废"},
+        },
+    )
+    def create_void(
+        payload: LicenseChangeVoidRequest, request: Request
+    ) -> JSONResponse | CreateResponse:
+        receipt, replayed = service_from(request).void_change(
+            void_id=payload.void_id,
+            change_id=payload.change_id,
+            reason=payload.reason,
+        )
+        body = CreateResponse(replayed=replayed, void=LicenseChangeVoidResponse(**receipt))
+        if replayed:
+            # 200 OK makes idempotent retries distinguishable from creation.
+            return JSONResponse(status_code=200, content=body.model_dump(mode="json"))
+        return body
+
+    @app.get(
+        "/license-change-voids",
+        response_model=list[LicenseChangeVoidResponse],
+        tags=["license-changes"],
+        summary="列出全部作废回执",
+    )
+    def list_voids(request: Request) -> list[LicenseChangeVoidResponse]:
+        return [LicenseChangeVoidResponse(**v) for v in service_from(request).list_voids()]
+
+    @app.get(
+        "/license-change-voids/{void_id}",
+        response_model=LicenseChangeVoidResponse,
+        tags=["license-changes"],
+        summary="按作废标识查询作废回执",
+        responses={404: {"description": "作废回执不存在"}},
+    )
+    def get_void(void_id: str, request: Request) -> LicenseChangeVoidResponse:
+        return LicenseChangeVoidResponse(**service_from(request).get_void(void_id))
 
     @app.post(
         "/license-changes/preview",

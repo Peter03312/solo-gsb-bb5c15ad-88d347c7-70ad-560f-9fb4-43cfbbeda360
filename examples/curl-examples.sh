@@ -57,3 +57,37 @@ curl -s -X POST "$BASE/license-changes/preview" -H 'Content-Type: application/js
 say "预演：相同标识与内容重放 -> replayed=true 且无影响（不写入）"
 curl -s -X POST "$BASE/license-changes/preview" -H 'Content-Type: application/json' \
   -d '{"change_id":"demo-chg-a-1","version_id":"demo-root-a","effective_at":"2026-01-01T00:00:00Z","allowed_uses":["review","research"],"use":"research","at":"2026-05-01T00:00:00Z"}'; echo
+
+say "作废：example-c1 登记有误，凭原变更标识 + 唯一作废标识 + 原因作废 -> 201 回执"
+curl -s -X POST "$BASE/license-change-voids" -H 'Content-Type: application/json' \
+  -d '{"void_id":"example-void-1","change_id":"example-c1","reason":"允许用途登记有误"}'; echo
+
+say "作废重试：同作废标识同内容 -> 200 replayed=true，返回原回执"
+curl -s -X POST "$BASE/license-change-voids" -H 'Content-Type: application/json' \
+  -d '{"void_id":"example-void-1","change_id":"example-c1","reason":"允许用途登记有误"}'; echo
+
+say "作废冲突 1：同作废标识不同内容 -> 409"
+curl -s -X POST "$BASE/license-change-voids" -H 'Content-Type: application/json' \
+  -d '{"void_id":"example-void-1","change_id":"example-c1","reason":"另一个原因"}'; echo
+
+say "作废冲突 2：以另一标识重复作废同一变更 -> 409"
+curl -s -X POST "$BASE/license-change-voids" -H 'Content-Type: application/json' \
+  -d '{"void_id":"example-void-2","change_id":"example-c1","reason":"再次作废"}'; echo
+
+say "作废目标不存在 -> 404"
+curl -s -X POST "$BASE/license-change-voids" -H 'Content-Type: application/json' \
+  -d '{"void_id":"example-void-9","change_id":"ghost-change","reason":"x"}'; echo
+
+say "作废即对所有查询时刻生效：example-v1 重新变为无有效许可"
+curl -s "$BASE/permissions/check?version_id=example-v1&use=research&at=2026-03-15T00:00:00Z"; echo
+
+say "回执追溯：按作废标识查询回执（含原标识、原因、登记时间）"
+curl -s "$BASE/license-change-voids/example-void-1"; echo
+
+say "原变更仍可按原接口查询（响应附带 void 回执）"
+curl -s "$BASE/license-changes/example-c1"; echo
+
+say "重放已作废的变更：200 replayed=true，但不能恢复（判定仍忽略它）"
+curl -s -X POST "$BASE/license-changes" -H 'Content-Type: application/json' \
+  -d '{"change_id":"example-c1","version_id":"example-v1","effective_at":"2026-03-01T00:00:00Z","allowed_uses":["research"]}'; echo
+curl -s "$BASE/permissions/check?version_id=example-v1&use=research&at=2026-03-15T00:00:00Z"; echo

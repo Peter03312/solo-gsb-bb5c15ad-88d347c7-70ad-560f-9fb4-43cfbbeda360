@@ -860,3 +860,260 @@ def test_timeline_on_demo_seed(tmp_path):
             for entry in research["segments"][2]["basis"]
         }
         assert basis_june["demo-root-a"] == "demo-chg-a-2"
+
+
+# -- license change voids ---------------------------------------------------
+
+
+def _void(client, void_id, change_id, reason):
+    return client.post(
+        "/license-change-voids",
+        json={"void_id": void_id, "change_id": change_id, "reason": reason},
+    )
+
+
+def test_void_returns_receipt_and_applies_to_all_query_instants(client):
+    _register(client, "v1")
+    _change(client, "c1", "v1", _iso(2026, 1, 1), ["research", "review"])
+    _change(client, "c2", "v1", _iso(2026, 6, 1), ["research"])
+
+    # Before the void: c2 governs July, c1 governs March.
+    assert _check(client, "v1", "review", _iso(2026, 7, 1)).json()["allowed"] is False
+    assert _check(client, "v1", "review", _iso(2026, 3, 1)).json()["allowed"] is True
+
+    resp = _void(client, "void-1", "c2", "用途全集登记有误")
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["replayed"] is False
+    receipt = body["void"]
+    assert receipt["void_id"] == "void-1"
+    assert receipt["change_id"] == "c2"
+    assert receipt["reason"] == "用途全集登记有误"
+    assert receipt["created_at"].endswith("Z") or receipt["created_at"].endswith("+00:00")
+
+    # The void applies to every query instant at once: July now falls back
+    # to the earlier non-voided change c1, so review becomes allowed again.
+    after = _check(client, "v1", "review", _iso(2026, 7, 1)).json()
+    assert after["allowed"] is True
+    assert [entry["change_id"] for entry in after["basis"]] == ["c1"]
+    # Instants before the voided change are untouched.
+    assert _check(client, "v1", "review", _iso(2026, 3, 1)).json()["allowed"] is True
+
+
+def test_void_only_change_blocks_with_no_valid_license(client):
+    _register(client, "v1")
+    _change(client, "c1", "v1", _iso(2026, 1, 1), ["research"])
+    assert _check(client, "v1", "research", _iso(2026, 2, 1)).json()["allowed"] is True
+
+    assert _void(client, "void-1", "c1", "登记错误").status_code == 201
+    body = _check(client, "v1", "research", _iso(2026, 2, 1)).json()
+    assert body["allowed"] is False
+    assert body["blockers"] == [
+        {"version_id": "v1", "reason": "no_valid_license", "change_id": None, "effective_at": None, "allowed_uses": []}
+    ]
+    assert body["basis"] == []
+
+
+def test_voided_change_stays_queryable_and_receipt_is_traceable(client):
+    _register(client, "v1")
+    _change(client, "c1", "v1", _iso(2026, 1, 1), ["research"])
+    receipt = _void(client, "void-1", "c1", "登记错误").json()["void"]
+
+    # The original change is still returned by the original interface, now
+    # carrying its void receipt.
+    change = client.get("/license-changes/c1").json()
+    assert change["change_id"] == "c1"
+    assert change["void"] == receipt
+
+    # The receipt is traceable by its own id, and appears in the list.
+    assert client.get("/license-change-voids/void-1").json() == receipt
+    listed = client.get("/license-change-voids").json()
+    assert [entry["void_id"] for entry in listed] == ["void-1"]
+
+    # Version detail embeds the same receipt on the change entry.
+    detail = client.get("/versions/v1").json()
+    assert detail["changes"][0]["void"]["void_id"] == "void-1"
+
+    # Unknown ids are 404 on both interfaces.
+    assert client.get("/license-change-voids/nope").status_code == 404
+    assert client.get("/license-changes/nope").status_code == 404
+
+
+def test_void_replay_same_id_same_content_returns_original_receipt(client):
+    _register(client, "v1")
+    _change(client, "c1", "v1", _iso(2026, 1, 1), ["research"])
+    first = _void(client, "void-1", "c1", "登记错误")
+    assert first.status_code == 201
+
+    second = _void(client, "void-1", "c1", "登记错误")
+    assert second.status_code == 200
+    assert second.json()["replayed"] is True
+    assert second.json()["void"] == first.json()["void"]
+
+    # Still exactly one void exists.
+    assert len(client.get("/license-change-voids").json()) == 1
+
+
+def test_void_same_id_different_content_conflicts(client):
+    _register(client, "v1")
+    _change(client, "c1", "v1", _iso(2026, 1, 1), ["research"])
+    _change(client, "c2", "v1", _iso(2026, 2, 1), ["review"])
+    assert _void(client, "void-1", "c1", "登记错误").status_code == 201
+
+    # Same void id, different reason.
+    resp = _void(client, "void-1", "c1", "另一个原因")
+    assert resp.status_code == 409
+    assert resp.json()["error"] == "conflict"
+    # Same void id, different target change.
+    resp = _void(client, "void-1", "c2", "登记错误")
+    assert resp.status_code == 409
+
+
+def test_void_same_change_twice_under_another_id_conflicts(client):
+    _register(client, "v1")
+    _change(client, "c1", "v1", _iso(2026, 1, 1), ["research"])
+    assert _void(client, "void-1", "c1", "登记错误").status_code == 201
+
+    resp = _void(client, "void-2", "c1", "再次作废")
+    assert resp.status_code == 409
+    assert resp.json()["error"] == "conflict"
+    assert "重复作废" in resp.json()["message"]
+    assert resp.json()["details"]["existing_void_id"] == "void-1"
+
+
+def test_void_unknown_change_is_404(client):
+    resp = _void(client, "void-1", "ghost-change", "登记错误")
+    assert resp.status_code == 404
+    assert resp.json()["error"] == "not_found"
+
+
+def test_void_requires_reason(client):
+    _register(client, "v1")
+    _change(client, "c1", "v1", _iso(2026, 1, 1), ["research"])
+    assert _void(client, "void-1", "c1", "   ").status_code == 422
+
+
+def test_void_omitted_id_is_generated(client):
+    _register(client, "v1")
+    _change(client, "c1", "v1", _iso(2026, 1, 1), ["research"])
+    resp = client.post(
+        "/license-change-voids", json={"change_id": "c1", "reason": "登记错误"}
+    )
+    assert resp.status_code == 201
+    void_id = resp.json()["void"]["void_id"]
+    assert void_id
+    assert client.get(f"/license-change-voids/{void_id}").status_code == 200
+
+
+def test_void_timeline_segments_by_unvoided_changes_only(client):
+    _register(client, "v1")
+    _change(client, "c1", "v1", _iso(2026, 1, 1), ["research", "review"])
+    _change(client, "c2", "v1", _iso(2026, 6, 1), ["research"])
+
+    before = _timeline(client, "v1", "review", _iso(2026, 3, 1), _iso(2026, 9, 1)).json()
+    assert len(before["segments"]) == 2
+
+    assert _void(client, "void-1", "c2", "登记错误").status_code == 201
+    body = _timeline(client, "v1", "review", _iso(2026, 3, 1), _iso(2026, 9, 1)).json()
+    # The voided change no longer splits the interval: one allowed segment
+    # based on c1 covers the whole range, with the usual response fields.
+    assert len(body["segments"]) == 1
+    segment = body["segments"][0]
+    assert segment["start"] == body["start"]
+    assert segment["end"] == body["end"]
+    assert segment["allowed"] is True
+    assert [entry["change_id"] for entry in segment["basis"]] == ["c1"]
+    assert segment["blockers"] == []
+    assert segment["allowed_uses_intersection"] == ["research", "review"]
+
+    # Voiding the last remaining change leaves a single no_valid_license span.
+    assert _void(client, "void-2", "c1", "也登记错误").status_code == 201
+    body = _timeline(client, "v1", "review", _iso(2026, 3, 1), _iso(2026, 9, 1)).json()
+    assert len(body["segments"]) == 1
+    segment = body["segments"][0]
+    assert segment["allowed"] is False
+    assert segment["blockers"] == [
+        {"version_id": "v1", "reason": "no_valid_license", "change_id": None, "effective_at": None, "allowed_uses": []}
+    ]
+
+
+def test_void_preview_uses_post_void_snapshot_and_writes_nothing(client):
+    _register(client, "a")
+    _change(client, "ca", "a", _iso(2026, 1, 1), ["research"])
+    _register(client, "d1", ["a"])
+    _change(client, "cd1", "d1", _iso(2026, 1, 1), ["research", "review"])
+    at = _iso(2026, 5, 1)
+
+    # Void the ancestor's only change: both a and d1 lose their license.
+    assert _void(client, "void-1", "ca", "登记错误").status_code == 201
+    assert _check(client, "d1", "research", at).json()["allowed"] is False
+
+    # Previewing a replacement change evaluates on the post-void snapshot:
+    # the "before" state is no_valid_license, the "after" state allows.
+    body = _preview_flip(client, "ca2", "a", _iso(2026, 4, 1), ["research"], "research", at).json()
+    flips = {entry["version_id"]: entry for entry in body["impacted_versions"]}
+    assert set(flips) == {"a", "d1"}
+    assert flips["a"]["before_blockers"][0]["reason"] == "no_valid_license"
+    assert all(entry["after_allowed"] is True for entry in flips.values())
+    # The preview itself persists nothing.
+    assert client.get("/license-changes/ca2").status_code == 404
+
+
+def test_change_replay_does_not_revive_voided_change(client):
+    _register(client, "v1")
+    payload = {
+        "change_id": "c1",
+        "version_id": "v1",
+        "effective_at": _iso(2026, 1, 1),
+        "allowed_uses": ["research"],
+    }
+    assert client.post("/license-changes", json=payload).status_code == 201
+    assert _void(client, "void-1", "c1", "登记错误").status_code == 201
+
+    # Replaying the original submission returns the stored change (200) but
+    # does not revive it: evaluation still ignores the voided change.
+    replay = client.post("/license-changes", json=payload)
+    assert replay.status_code == 200
+    assert replay.json()["replayed"] is True
+    assert replay.json()["change"]["void"]["void_id"] == "void-1"
+    body = _check(client, "v1", "research", _iso(2026, 2, 1)).json()
+    assert body["allowed"] is False
+    assert body["blockers"][0]["reason"] == "no_valid_license"
+
+
+def test_voided_change_still_occupies_its_effective_instant(client):
+    # The same-version/same-instant conflict rule is unchanged: a voided
+    # change still blocks a *different* change at that exact instant.
+    _register(client, "v1")
+    _change(client, "c1", "v1", _iso(2026, 1, 1), ["research"])
+    assert _void(client, "void-1", "c1", "登记错误").status_code == 201
+
+    resp = _change(client, "c2", "v1", _iso(2026, 1, 1), ["review"])
+    assert resp.status_code == 409
+    assert "同一生效时刻" in resp.json()["message"]
+
+    # A correction must use a different effective instant.
+    assert _change(client, "c2", "v1", _iso(2026, 1, 2), ["review"]).status_code == 201
+    body = _check(client, "v1", "review", _iso(2026, 2, 1)).json()
+    assert body["allowed"] is True
+    assert [entry["change_id"] for entry in body["basis"]] == ["c2"]
+
+
+def test_void_affects_ancestor_closure_evaluation(client):
+    _register(client, "a")
+    _change(client, "ca1", "a", _iso(2026, 1, 1), ["research", "review"])
+    _change(client, "ca2", "a", _iso(2026, 6, 1), ["research"])
+    _register(client, "d1", ["a"])
+    _change(client, "cd1", "d1", _iso(2026, 1, 1), ["research", "review"])
+
+    # d1 is denied review in July because a's June change dropped it.
+    denied = _check(client, "d1", "review", _iso(2026, 7, 1)).json()
+    assert denied["allowed"] is False
+    assert [bl["change_id"] for bl in denied["blockers"]] == ["ca2"]
+
+    # Voiding the ancestor's erroneous change unblocks the descendant too.
+    assert _void(client, "void-1", "ca2", "登记错误").status_code == 201
+    restored = _check(client, "d1", "review", _iso(2026, 7, 1)).json()
+    assert restored["allowed"] is True
+    basis = {entry["version_id"]: entry["change_id"] for entry in restored["basis"]}
+    assert basis == {"d1": "cd1", "a": "ca1"}
